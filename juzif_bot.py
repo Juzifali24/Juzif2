@@ -5,7 +5,7 @@ import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
 # ---------------- Config ----------------
-BOT_TOKEN = "8412113399:AAEKkxOk-JHL1Q-mVJYNZZ3hdc2Q9oxxbg4"
+BOT_TOKEN = "8412113399:AAEIGNuA1iyDQFBXGoc2GchDvzvjMapaKQY"
 CHANNEL_ID = "-1003203955147"
 ADMIN_ID = 1973076813
 SUBSCRIBE_CHANNEL = "TILAWA_1"
