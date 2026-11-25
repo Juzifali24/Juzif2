@@ -1,155 +1,114 @@
 #!/usr/bin/env python3
-# juzif_compressor_ready.py
-# Bot for Render: receives audio/video files, compresses them, posts to channel
-# Author: prepared for Juzif
-
-import os
-import uuid
-import shutil
-import tempfile
-import subprocess
-from time import time
-from flask import Flask, request
+# Media Minifier Bot - BotHosting Ready (Polling Mode) with Real Progress
+import os, uuid, shutil, tempfile, subprocess, time, re
 import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
-
-# ------------------ Configuration ------------------
-
-BOT_TOKEN = os.getenv("BOT_TOKEN") or "8412113399:AAEIGNuA1iyDQFBXGoc2GchDvzvjMapaKQY"
-CHANNEL_ID = os.getenv("CHANNEL_ID") or "-1003203955147"
-WEBHOOK_URL = os.getenv("WEBHOOK_URL") or "https://juzif-bot.onrender.com/" + BOT_TOKEN
-
-OWNER_ID = 1973076813
-
-if not BOT_TOKEN or not CHANNEL_ID:
-    raise SystemExit("BOT_TOKEN and CHANNEL_ID must be provided via environment or in-file defaults.")
-
-
-# ------------------ Init ------------------
+# ---------------- Config ----------------
+BOT_TOKEN = "8412113399:AAEKkxOk-JHL1Q-mVJYNZZ3hdc2Q9oxxbg4"
+CHANNEL_ID = "-1003203955147"
+ADMIN_ID = 1973076813
+SUBSCRIBE_CHANNEL = "TILAWA_1"
+BOT_LINK = "http://t.me/MediaMinifierBot"
 
 bot = telebot.TeleBot(BOT_TOKEN)
-app = Flask(__name__)
+pending = {}
 
-# pending dict for video items waiting for user choice
-pending = {}  # token -> {"video": path, "audio": path, "orig": path, "title": str, "created": ts}
-
-
-# ------------------ Helpers ------------------
-
-def cleanup_pending(max_age_seconds=3600):
-    """Remove pending items older than max_age_seconds and delete files."""
-    now = time()
-    for key, value in list(pending.items()):
-        if now - value.get("created", 0) > max_age_seconds:
-            try:
-                base = os.path.dirname(value.get("orig", "")) or None
-                if base and os.path.exists(base):
-                    shutil.rmtree(base, ignore_errors=True)
-            except Exception:
-                pass
-            pending.pop(key, None)
-
-
-def file_size_mb(path):
-    try:
-        return os.path.getsize(path) / (1024.0*1024.0)
-    except Exception:
-        return 0.0
-
+# ---------------- Helpers ----------------
+def cleanup_pending(max_age=3600):
+    now = time.time()
+    for k, v in list(pending.items()):
+        if now - v.get("created", 0) > max_age:
+            if os.path.exists(os.path.dirname(v.get("orig", ""))):
+                shutil.rmtree(os.path.dirname(v["orig"]), ignore_errors=True)
+            pending.pop(k, None)
 
 def ffmpeg_available():
     from shutil import which
     return which("ffmpeg") is not None
 
-
-def download_telegram_file(file_id, dest_path):
+def download_file(file_id, dest):
     try:
-        file_info = bot.get_file(file_id)
-        data = bot.download_file(file_info.file_path)
-        with open(dest_path, "wb") as f:
-            f.write(data)
-        return True
+        finfo = bot.get_file(file_id)
+        data = bot.download_file(finfo.file_path)
     except Exception as e:
         print("Download error:", e)
         return False
+    with open(dest, "wb") as f:
+        f.write(data)
+    return True
 
+def ffmpeg_progress(command, msg, chat_id):
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+    duration = None
+    last_progress = 0
+    for line in process.stdout:
+        if duration is None:
+            m = re.search(r'Duration: (\d+):(\d+):(\d+.\d+)', line)
+            if m:
+                h, m_, s = m.groups()
+                duration = int(h)*3600 + int(m_)*60 + float(s)
+        m = re.search(r'time=(\d+):(\d+):(\d+.\d+)', line)
+        if m and duration:
+            h, m_, s = m.groups()
+            elapsed = int(h)*3600 + int(m_)*60 + float(s)
+            progress = int((elapsed / duration) * 100)
+            if progress > last_progress and progress <= 100:
+                last_progress = progress
+                try:
+                    bot.edit_message_text(f"⏳ جاري ضغط الملف... {progress}%", chat_id, msg.message_id)
+                except:
+                    pass
+    process.wait()
+    return process.returncode == 0
 
-def run_ffmpeg_convert_to_audio(input_path, output_path, bitrate_k="16k", samplerate=16000, timeout=300):
-    """Convert any input to low-bitrate mp3 (mono). Returns True if success."""
-    if not ffmpeg_available():
-        print("ffmpeg not available on system.")
-        return False
-    cmd = [
-        "ffmpeg", "-y", "-i", input_path,
-        "-ac", "1",
-        "-ar", str(samplerate),
-        "-b:a", str(bitrate_k),
-        "-vn",
-        output_path
-    ]
+def user_name(m):
+    return f"@{m.from_user.username}" if m.from_user.username else m.from_user.first_name
+
+def subscription_check(user_id):
     try:
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=timeout)
-        return os.path.exists(output_path)
-    except Exception as e:
-        print("ffmpeg audio error:", e)
+        member = bot.get_chat_member(f"@{SUBSCRIBE_CHANNEL}", user_id)
+        return member.status in ["member", "administrator", "creator"]
+    except:
         return False
 
-
-def run_ffmpeg_compress_video(input_path, output_path,
-                              video_bitrate="200k", audio_bitrate="16k", scale_width=320, samplerate=16000, timeout=600):
-    """Compress video to small resolution/bitrate. Returns True if success."""
-    if not ffmpeg_available():
-        print("ffmpeg not available on system.")
-        return False
-    vf = f"scale='min({scale_width},iw)':-2"
-    cmd = [
-        "ffmpeg", "-y", "-i", input_path,
-        "-c:v", "libx264", "-preset", "veryfast",
-        "-b:v", video_bitrate, "-maxrate", video_bitrate, "-bufsize", "2M",
-        "-vf", vf,
-        "-c:a", "aac", "-b:a", audio_bitrate, "-ac", "1", "-ar", str(samplerate),
-        "-movflags", "+faststart",
-        output_path
-    ]
-    try:
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=timeout)
-        return os.path.exists(output_path)
-    except Exception as e:
-        print("ffmpeg video error:", e)
-        return False
-
-
-# ------------------ Bot handlers ------------------
-
+# ---------------- /start ----------------
 @bot.message_handler(commands=["start"])
 def cmd_start(m):
-
-    if m.from_user.id != OWNER_ID:
-        bot.reply_to(m, "⛔ هذا البوت خاص بمالكه فقط.")
+    if not subscription_check(m.from_user.id):
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("اشترك أولاً", url=f"https://t.me/{SUBSCRIBE_CHANNEL}"))
+        bot.reply_to(m, f"⚠️ يجب الاشتراك في قناة @{SUBSCRIBE_CHANNEL} لاستخدام البوت.", reply_markup=kb)
         return
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("أَذّكَارِي.🫧", url="https://t.me/Er42Bot"))
+    kb.add(InlineKeyboardButton("غرَاسَ الْجَنَّةِ. 🤍", url="https://t.me/JuzifAliBot"))
+    bot.reply_to(
+        m,
+        f"السلام عليكم، {user_name(m)}\n\n"
+        "ـ Media Minifier بُوت مُتَخَصّص فِي ضَغطِ الصَّوتِياتِ والفِيدِيوهُاتِ، قُم بإرسَالِ مَقّطَع الصُوتِ او الفِيديُو وانّتَظِر حَتَّى ينّتَهي مِن ضَغّطِه.\n\n"
+        "ـ مُلاحَظةٌ:- لَا أُسَامَحْ ابَدًا مَنْ اسّتَخَدَم البُوت فِي ضَغطِ الأغَانِي والمُوسِيقَى "
+        "او شَيٌء لَا يُرضِي رَبَّنَا عَزَّ وجَلْ.\n\n"
+        "ـ بُوتَاتِي الأُخّرَى:\n"
+        "١ـ أَذّكَارِي.🫧 ، نَشرُ صَوتِيات وصور دينية.\n"
+        "٢ـ غرَاسَ الْجَنَّةِ. 🤍 ، نَشرُ تَسبِيح تلقائي كل ساعة.",
+        reply_markup=kb
+    )
 
-    bot.reply_to(m, "أرسل ملف صوتي أو فيديو. الصوت يُضغط وينشر فوراً، الفيديو يُضغط ثم تُختار نشره كفيديو أو كصوت.")
-
-
-@bot.message_handler(content_types=['audio', 'voice', 'video', 'document', 'video_note'])
+# ---------------- Media Handler ----------------
+@bot.message_handler(content_types=['audio','voice','video','document','video_note'])
 def handle_media(m):
-
-    if m.from_user.id != OWNER_ID:
-        bot.reply_to(m, "⛔ هذا البوت خاص بمالكه فقط.")
+    # ✅ التعديل 1: تجاهل صامت لأي شخص ليس المالك
+    if not m.from_user or m.from_user.id != ADMIN_ID:
         return
 
     cleanup_pending()
-
-    # determine file id and filename
-    file_id = None
-    filename = None
-    mime = None
+    file_id, filename, mime = None, None, None
     content_type = m.content_type
 
     if content_type == 'audio':
         file_id = m.audio.file_id
         filename = m.audio.file_name or f"audio_{uuid.uuid4().hex}.ogg"
-        mime = m.audio.mime_type
     elif content_type == 'voice':
         file_id = m.voice.file_id
         filename = f"voice_{uuid.uuid4().hex}.ogg"
@@ -157,7 +116,6 @@ def handle_media(m):
     elif content_type == 'video':
         file_id = m.video.file_id
         filename = m.video.file_name or f"video_{uuid.uuid4().hex}.mp4"
-        mime = m.video.mime_type
     elif content_type == 'video_note':
         file_id = m.video_note.file_id
         filename = f"vidnote_{uuid.uuid4().hex}.mp4"
@@ -170,166 +128,105 @@ def handle_media(m):
         bot.reply_to(m, "نوع الملف غير مدعوم.")
         return
 
-    bot.reply_to(m, "⏳ استلمت الملف، جاري ضغطه الآن... قد يستغرق بضع ثواني إلى دقائق حسب الحجم.")
-
-    # create session dir
     session_dir = tempfile.mkdtemp(prefix="job_")
     orig_path = os.path.join(session_dir, filename)
+    download_file(file_id, orig_path)
 
-    if not download_telegram_file(file_id, orig_path):
-        bot.reply_to(m, "❌ فشل تنزيل الملف من تيليجرام.")
-        shutil.rmtree(session_dir, ignore_errors=True)
+    pending[m.chat.id] = {
+        "orig": orig_path,
+        "title": os.path.splitext(filename)[0],
+        "is_audio": (content_type in ['audio','voice']) or (mime and mime.startswith("audio")),
+        "created": time.time(),
+        "user": m.from_user
+    }
+
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("🟢 عالية (128k)", callback_data="quality_128"))
+    kb.add(InlineKeyboardButton("🟡 متوسطة (96k)", callback_data="quality_96"))
+    kb.add(InlineKeyboardButton("🔵 منخفضة (64k)", callback_data="quality_64"))
+    kb.add(InlineKeyboardButton("🔴 منخفضة جدًا (32k)", callback_data="quality_32"))
+    bot.reply_to(m, "🎚 قم باختيار الجودة المرغوبة:", reply_markup=kb)
+
+# ---------------- Callback for Quality ----------------
+@bot.callback_query_handler(func=lambda call: call.data.startswith("quality_"))
+def handle_quality(call: CallbackQuery):
+    # ✅ التعديل 1 (تكملة): تجاهل صامت لأي شخص ليس المالك
+    if not call.from_user or call.from_user.id != ADMIN_ID:
         return
 
-    title = os.path.splitext(filename)[0]
-    is_audio = (content_type in ['audio', 'voice']) or (mime and mime.startswith("audio"))
+    chat_id = call.message.chat.id
+    if chat_id not in pending:
+        bot.answer_callback_query(call.id, "⛔ انتهت الجلسة، أرسل الملف مرة أخرى.")
+        return
+
+    bitrate = call.data.split("_")[1]
+    info = pending.pop(chat_id)
+    orig_path = info["orig"]
+    title = info["title"]
+    is_audio = info["is_audio"]
+    user = info["user"]
+
+    # تحديث نفس الرسالة لإظهار التقدم وحذف الأزرار
+    msg_progress = bot.edit_message_text("⏳ جاري ضغط الملف... 0%", chat_id, call.message.message_id, reply_markup=None)
+    chat_id_progress = chat_id
+    session_dir = os.path.dirname(orig_path)
+
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("Media Minifier", url=BOT_LINK))
 
     try:
         if is_audio:
             out_audio = os.path.join(session_dir, f"{title}_compressed.mp3")
-            ok = run_ffmpeg_convert_to_audio(orig_path, out_audio, bitrate_k="16k", samplerate=16000)
-            if not ok:
-                bot.reply_to(m, "❌ فشل ضغط الملف الصوتي (ffmpeg ربما غير متاح).")
+            cmd = ["ffmpeg", "-y", "-i", orig_path, "-ac", "1", "-ar", "16000", f"-b:a", f"{bitrate}k", "-vn", out_audio]
+            if not ffmpeg_progress(cmd, msg_progress, chat_id_progress):
+                bot.send_message(chat_id, "❌ فشل ضغط الملف الصوتي.")
                 shutil.rmtree(session_dir, ignore_errors=True)
                 return
-            size = file_size_mb(out_audio)
-            # send to channel immediately
-            with open(out_audio, "rb") as f:
-                bot.send_audio(CHANNEL_ID, f, caption=f"🔊 {title} — مضغوط {size:.2f} MB", timeout=120)
-            bot.reply_to(m, f"✅ تم ضغط الصوت ({size:.2f} MB) ونشره في القناة.")
-            shutil.rmtree(session_dir, ignore_errors=True)
-            return
 
-        # For video (or other media) => produce compressed video and audio file, register pending token
-        out_video = os.path.join(session_dir, f"{title}_compressed.mp4")
-        out_audio_from_video = os.path.join(session_dir, f"{title}_audio.mp3")
+            caption_user = "تم ضغطه ومعالجته من قِبل بوت Media Minifier - @MediaMinifierBot"
+            caption_channel = f"منشور من: @{user.username if user.username else user.first_name}\n{caption_user}"
 
-        ok_video = run_ffmpeg_compress_video(orig_path, out_video, video_bitrate="200k", audio_bitrate="16k", scale_width=320)
-        ok_audio = run_ffmpeg_convert_to_audio(orig_path, out_audio_from_video, bitrate_k="16k", samplerate=16000)
+            # ✅ التعديل 2: إرسال للخاص أولًا، ثم للقناة بـ file_id (بدون رفع مزدوج)
+            sent = bot.send_audio(chat_id, open(out_audio, "rb"), caption=caption_user, reply_markup=kb)
+            bot.send_audio(CHANNEL_ID, sent.audio.file_id, caption=caption_channel, reply_markup=kb)
 
-        token = uuid.uuid4().hex
-        pending[token] = {
-            "video": out_video if ok_video and os.path.exists(out_video) else None,
-            "audio": out_audio_from_video if ok_audio and os.path.exists(out_audio_from_video) else None,
-            "orig": orig_path,
-            "title": title,
-            "created": time()
-        }
-
-        # build message and buttons
-        parts = [f"✅ الملف جاهز: {title}"]
-        if pending[token]["video"]:
-            parts.append(f"🔹 فيديو مضغوط ~ {file_size_mb(pending[token]['video']):.2f} MB")
         else:
-            parts.append("⚠️ لم يتم إنشاء فيديو مضغوط صالح.")
+            out_video = os.path.join(session_dir, f"{title}_compressed.mp4")
+            vf = f"scale='min(320,iw)':-2"
+            cmd = ["ffmpeg", "-y", "-i", orig_path, "-c:v", "libx264", "-preset", "veryfast",
+                   "-b:v", f"{bitrate}k", "-maxrate", f"{bitrate}k", "-bufsize", "2M", "-vf", vf,
+                   "-c:a", "aac", "-b:a", f"{bitrate}k", "-ac", "1", "-ar", "16000",
+                   "-movflags", "+faststart", out_video]
+            if not ffmpeg_progress(cmd, msg_progress, chat_id_progress):
+                bot.send_message(chat_id, "❌ فشل ضغط الفيديو.")
+                shutil.rmtree(session_dir, ignore_errors=True)
+                return
 
-        if pending[token]["audio"]:
-            parts.append(f"🔹 صوت مضغوط ~ {file_size_mb(pending[token]['audio']):.2f} MB")
-        else:
-            parts.append("⚠️ لم يتم إنشاء صوت من الفيديو.")
+            caption_user = "تم ضغطه ومعالجته من قِبل بوت Media Minifier - @MediaMinifierBot"
+            caption_channel = f"منشور من: @{user.username if user.username else user.first_name}\n{caption_user}"
 
-        from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-        kb = InlineKeyboardMarkup()
-        if pending[token]["video"]:
-            kb.add(InlineKeyboardButton("📤 نشر كفيديو مضغوط", callback_data=f"post:video:{token}"))
-        if pending[token]["audio"]:
-            kb.add(InlineKeyboardButton("🎧 نشر كصوت مضغوط", callback_data=f"post:audio:{token}"))
-        kb.add(InlineKeyboardButton("🗑️ إلغاء وحذف", callback_data=f"cancel:{token}"))
+            # ✅ التعديل 2: إرسال للخاص أولًا، ثم للقناة بـ file_id (بدون رفع مزدوج)
+            sent = bot.send_video(chat_id, open(out_video, "rb"), caption=caption_user, reply_markup=kb)
+            bot.send_video(CHANNEL_ID, sent.video.file_id, caption=caption_channel, reply_markup=kb)
 
-        bot.reply_to(m, "\n".join(parts), reply_markup=kb)
+        bot.edit_message_text("✅ تم ضغط الملف وإرساله بنجاح.", chat_id_progress, msg_progress.message_id)
 
     except Exception as e:
-        print("Processing error:", e)
-        bot.reply_to(m, f"❌ حدث خطأ أثناء المعالجة: {e}")
+        bot.send_message(chat_id, f"❌ خطأ أثناء المعالجة: {e}")
+    finally:
         shutil.rmtree(session_dir, ignore_errors=True)
-        pending.pop(token, None)
 
-
-# ------------------ Callback handler ------------------
-
-@bot.callback_query_handler(func=lambda call: True)
-def handle_callback(call):
-
-    if not call.from_user or call.from_user.id != OWNER_ID:
-        bot.answer_callback_query(
-            call.id,
-            "⛔ هذا البوت خاص بمالكه فقط.",
-            show_alert=True
-        )
-        return
-
-    data = call.data
-    try:
-        action, typ, token = data.split(":")
-    except Exception:
-        bot.answer_callback_query(call.id, "بيانات غير مفهومة.")
-        return
-
-    entry = pending.get(token)
-    if not entry:
-        bot.answer_callback_query(call.id, "انتهت صلاحية هذا الطلب أو تم حذفه.")
-        return
-
-    try:
-        if action == "post" and typ == "video":
-            if not entry.get("video") or not os.path.exists(entry["video"]):
-                bot.answer_callback_query(call.id, "لا يوجد ملف فيديو صالح للنشر.")
-                return
-            with open(entry["video"], "rb") as f:
-                bot.send_video(CHANNEL_ID, f, caption=f"🎬 {entry.get('title')}", timeout=300)
-            bot.edit_message_text("✅ تم نشر الفيديو المضغوط في القناة.", call.message.chat.id, call.message.message_id)
-            bot.answer_callback_query(call.id, "تم النشر كفيديو.")
-        elif action == "post" and typ == "audio":
-            if not entry.get("audio") or not os.path.exists(entry["audio"]):
-                bot.answer_callback_query(call.id, "لا يوجد ملف صوت صالح للنشر.")
-                return
-            with open(entry["audio"], "rb") as f:
-                bot.send_audio(CHANNEL_ID, f, caption=f"🔊 {entry.get('title')}", timeout=300)
-            bot.edit_message_text("✅ تم نشر الملف كصوت مضغوط في القناة.", call.message.chat.id, call.message.message_id)
-            bot.answer_callback_query(call.id, "تم النشر كصوت.")
-        elif action == "cancel":
-            bot.edit_message_text("🗑️ تم الإلغاء وحذف الملفات.", call.message.chat.id, call.message.message_id)
-            bot.answer_callback_query(call.id, "تم الإلغاء.")
-        # cleanup files & pending
-        base_dir = os.path.dirname(entry.get("orig")) if entry.get("orig") else None
-        if base_dir and os.path.exists(base_dir):
-            shutil.rmtree(base_dir, ignore_errors=True)
-        pending.pop(token, None)
-    except Exception as e:
-        print("Callback handling error:", e)
-        bot.answer_callback_query(call.id, f"حدث خطأ: {e}")
-
-
-# ------------------ Webhook routes ------------------
-
-@app.route("/" + BOT_TOKEN, methods=["POST"])
-def webhook_receiver():
-    try:
-        update = request.get_data().decode("utf-8")
-        bot.process_new_updates([telebot.types.Update.de_json(update)])
-    except Exception as e:
-        print("Webhook processing error:", e)
-    return "OK", 200
-
-
-@app.route("/", methods=["GET"])
-def index():
-    # try to set webhook automatically if WEBHOOK_URL provided
-    try:
-        bot.remove_webhook()
-        bot.set_webhook(url=WEBHOOK_URL)
-        return f"Webhook set to {WEBHOOK_URL}", 200
-    except Exception as e:
-        print("Set webhook error:", e)
-        return f"Webhook set error: {e}", 500
-
-
-# ------------------ Run (Polling) ------------------
-
+# ---------------- Run Bot ----------------
 if __name__ == "__main__":
-    print("Starting bot in Polling mode...")
+    print("✅ Bot is running via Long Polling...")
     try:
         bot.remove_webhook()
-    except Exception:
-        pass
-    bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=50)
+        print("✅ Webhook removed (if any).")
+    except Exception as e:
+        print("⚠️ remove_webhook warning:", e)
+    while True:
+        try:
+            bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=50)
+        except Exception as e:
+            print("Bot polling error:", e)
+            time.sleep(5)
